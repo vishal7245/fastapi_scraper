@@ -75,6 +75,12 @@ COPY --from=builder /app/requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache /wheels/*
 
+# Set up browserforge data
+RUN mkdir -p /usr/local/lib/python3.11/site-packages/browserforge/headers/data && \
+    wget -O /usr/local/lib/python3.11/site-packages/browserforge/headers/data/input-network.zip \
+    https://github.com/browserforge/browserforge/raw/main/browserforge/headers/data/input-network.zip && \
+    chown -R appuser:appuser /usr/local/lib/python3.11/site-packages/browserforge
+
 # Copy application code
 COPY . .
 
