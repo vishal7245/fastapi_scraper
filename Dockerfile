@@ -63,6 +63,11 @@ RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key
     && apt-get install -y --no-install-recommends google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
+# Create a non-root user
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /home/appuser/.browserforge && \
+    chown -R appuser:appuser /home/appuser/.browserforge
+
 # Copy wheels from builder
 COPY --from=builder /app/wheels /wheels
 COPY --from=builder /app/requirements.txt .
@@ -73,9 +78,9 @@ RUN pip install --no-cache /wheels/*
 # Copy application code
 COPY . .
 
-# Create a non-root user
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
+# Set ownership of app directory
+RUN chown -R appuser:appuser /app
+
 USER appuser
 
 # Set environment variables
@@ -83,6 +88,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV CHROME_BIN=/usr/bin/google-chrome
 ENV CHROME_PATH=/usr/lib/chromium/
+ENV BROWSERFORGE_DATA_DIR=/home/appuser/.browserforge
 
 # Expose the port the app runs on
 EXPOSE 8001
