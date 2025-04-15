@@ -56,7 +56,7 @@ async def get_product_info(asin: str, token: str = Depends(verify_token)):
     
     - **asin**: Amazon Standard Identification Number (ASIN)
     """
-    product_data = scrape_amazon_product(asin)
+    product_data = await scrape_amazon_product(asin)
     
     if product_data is None:
         raise HTTPException(status_code=404, detail="Product not found or error occurred while scraping")
