@@ -5,11 +5,8 @@ beautifulsoup4==4.12.2
 python-jose[cryptography]==3.3.0
 python-dotenv==1.0.0
 fake-useragent==1.4.0
-selenium==4.18.1
-undetected-chromedriver==3.5.5
 python-socks==2.4.4
-aiohttp==3.9.3
+aiohttp==3.9.1
 aiohttp-socks==0.8.4
-webdriver-manager==3.9.1
-playwright==1.42.0 
+playwright==1.42.0
 browserforge==1.2.3

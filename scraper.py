@@ -8,15 +8,10 @@ from typing import Optional, Dict, Any
 from proxy_manager import ProxyManager
 from browser_fingerprint import BrowserFingerprint
 from delay_manager import DelayManager
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
 import asyncio
 import aiohttp
 from aiohttp_socks import ProxyConnector
-
+import os
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -29,222 +24,146 @@ class AmazonScraper:
         self.proxy_manager = ProxyManager()
         self.browser_fingerprint = BrowserFingerprint()
         self.delay_manager = DelayManager()
-        self.driver = None
+        self.browserless_api_key = os.getenv('BROWSERLESS_API_KEY')
         
     async def initialize(self):
         """Initialize the scraper components"""
         await self.proxy_manager.validate_all_proxies()
         
-    def setup_driver(self):
-        """Setup undetected-chromedriver"""
-        options = uc.ChromeOptions()
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('--disable-infobars')
-        options.add_argument('--start-maximized')
-        
-        # Set random viewport size
-        width, height = random.choice(self.browser_fingerprint.screen_resolutions)
-        options.add_argument(f'--window-size={width},{height}')
-        
-        # Let undetected-chromedriver handle Chrome binary detection
-        self.driver = uc.Chrome(
-            options=options,
-            driver_executable_path=None,  # Let it use the default path
-            browser_executable_path=None  # Let it detect Chrome automatically
-        )
-        
-    async def scrape_with_selenium(self, asin: str) -> Optional[Dict[str, Any]]:
-        """Scrape using Selenium with undetected-chromedriver"""
-        if not self.driver:
-            self.setup_driver()
-            
+    async def scrape_with_browserless(self, asin: str) -> Optional[Dict[str, Any]]:
+        """Scrape using Browserless with captcha solving capability"""
         url = f"https://www.amazon.in/dp/{asin}"
         
         try:
-            self.driver.get(url)
+            # Prepare the Browserless API request with token in URL
+            browserless_url = f"https://browserless.tripxap.com/content?token={self.browserless_api_key}"
             
-            # Wait for page load
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.ID, "productTitle"))
-            )
+            headers = {
+                "Content-Type": "application/json"
+            }
             
-            # Check for captcha
-            if "captcha" in self.driver.page_source.lower():
-                logger.warning("Captcha detected, retrying with different method")
-                return await self.scrape_with_requests(asin)
+            # Enhanced payload with captcha solving capabilities
+            payload = {
+                "url": url,
+                "waitForFunction": """async () => {
+                    try {
+                        const cdp = await page.createCDPSession();
+                        // Wait for any captcha to appear
+                        const captchaExists = await page.$('form[action*="/errors/validateCaptcha"]');
+                        if (captchaExists) {
+                            console.log('Captcha found, attempting to solve...');
+                            const { solved, error } = await cdp.send('Browserless.solveCaptcha');
+                            if (solved) {
+                                console.log('Captcha solved successfully');
+                                // Wait for navigation after captcha
+                                await page.waitForNavigation({ waitUntil: 'networkidle0' });
+                            } else {
+                                console.error('Failed to solve captcha:', error);
+                            }
+                        }
+                        // Wait for product title as indication of successful page load
+                        await page.waitForSelector('#productTitle', { timeout: 10000 });
+                        return true;
+                    } catch (e) {
+                        console.error('Error in waitForFunction:', e);
+                        return false;
+                    }
+                }""",
+                "waitForTimeout": 15000  # Increased timeout to allow for captcha solving
+            }
             
-            # Extract data using Selenium
-            product_data = {}
-            
-            # Product Title
-            title_element = self.driver.find_element(By.ID, "productTitle")
-            product_data['title'] = title_element.text.strip()
-            
-            # Price
-            try:
-                price_element = self.driver.find_element(By.CLASS_NAME, "a-price-whole")
-                product_data['price'] = price_element.text.strip()
-            except:
-                product_data['price'] = 'Not found'
-            
-            # MRP
-            try:
-                mrp_element = self.driver.find_element(By.CLASS_NAME, "a-price a-text-price")
-                mrp = mrp_element.find_element(By.CLASS_NAME, "a-offscreen")
-                product_data['mrp'] = mrp.text.strip()
-            except:
-                product_data['mrp'] = 'Not found'
-            
-            # ASIN
-            asin_element = self.driver.find_element(By.NAME, 'ASIN')
-            product_data['asin'] = asin_element.get_attribute('value') if asin_element else 'Not found'
-            
-            # SKU ID (Item model number)
-            sku_id = None
-            
-            # Try multiple selectors for different page layouts
-            sku_selectors = [
-                # Product Details section
-                (By.ID, 'productDetails_detailBullets_sections1'),
-                # Product Specifications section
-                (By.ID, 'productDetails_techSpec_section_1'),
-                # Model number row
-                (By.XPATH, '//tr[contains(@class, "model_number")]'),
-                (By.XPATH, '//tr[contains(@class, "po-model_number")]'),
-                # Direct model number span
-                (By.XPATH, '//span[contains(text(), "Model Number")]/following-sibling::span'),
-                (By.XPATH, '//span[contains(text(), "Item model number")]/following-sibling::span')
-            ]
-            
-            for selector_type, selector in sku_selectors:
-                try:
-                    if selector_type == By.ID:
-                        element = self.driver.find_element(selector_type, selector)
-                        rows = element.find_elements(By.TAG_NAME, 'tr')
-                        for row in rows:
-                            if any(keyword in row.text.lower() for keyword in ['model number', 'item model number']):
-                                sku_id = row.find_element(By.TAG_NAME, 'td').text.strip()
-                                break
+            async with aiohttp.ClientSession() as session:
+                async with session.post(browserless_url, json=payload, headers=headers) as response:
+                    if response.status == 200:
+                        html_content = await response.text()
+                        if "To discuss automated access to Amazon data please contact" in html_content:
+                            logger.error("Amazon blocked the request despite captcha solving attempt")
+                            return None
+                        soup = BeautifulSoup(html_content, 'html.parser')
+                        return self._extract_product_data(soup)
                     else:
-                        element = self.driver.find_element(selector_type, selector)
-                        if element:
-                            sku_id = element.text.strip()
-                            break
-                except:
-                    continue
-                
-                if sku_id:
-                    break
-            
-            product_data['sku_id'] = sku_id if sku_id else 'Not found'
-            
-            # Percentage Discount
-            discount_element = self.driver.find_element(By.CLASS_NAME, 'savingsPercentage')
-            if discount_element:
-                product_data['percentage_discount'] = discount_element.text.strip()
-            else:
-                # Calculate discount percentage if we have both price and MRP
-                if product_data['price'] != 'Not found' and product_data['mrp'] != 'Not found':
-                    try:
-                        price = float(product_data['price'].replace(',', ''))
-                        mrp = float(product_data['mrp'].replace('₹', '').replace(',', '').strip())
-                        discount = ((mrp - price) / mrp) * 100
-                        product_data['percentage_discount'] = f"{discount:.2f}%"
-                    except (ValueError, ZeroDivisionError):
-                        product_data['percentage_discount'] = 'Not found'
-                else:
-                    product_data['percentage_discount'] = 'Not found'
-            
-            # Rating
-            rating_element = self.driver.find_element(By.CLASS_NAME, 'a-icon-alt')
-            product_data['rating'] = rating_element.text.split()[0] if rating_element else 'Not found'
-            
-            # Number of ratings
-            num_ratings_element = self.driver.find_element(By.ID, 'acrCustomerReviewText')
-            product_data['num_ratings'] = num_ratings_element.text.strip() if num_ratings_element else 'Not found'
-            
-            # About this item
-            about_items = []
-            try:
-                # Try multiple selectors for different page layouts
-                selectors = [
-                    'div#feature-bullets ul.a-unordered-list li span.a-list-item',
-                    'div#feature-bullets ul.a-vertical-spacing-small li span.a-list-item',
-                    'div#feature-bullets ul.a-spacing-small li span.a-list-item',
-                    'div#feature-bullets ul.a-vertical li span.a-list-item',
-                    'div#feature-bullets ul li span.a-list-item',
-                    'div#feature-bullets ul li span.a-text-bold',
-                    'div#feature-bullets ul li'
-                ]
-                
-                for selector in selectors:
-                    bullet_points = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if bullet_points:
-                        for bullet in bullet_points:
-                            text = bullet.text.strip()
-                            if text and text not in about_items:  # Avoid duplicates
-                                about_items.append(text)
-                        if about_items:  # If we found items with this selector, break
-                            break
-                            
-                # If still no items found, try alternative approach
-                if not about_items:
-                    feature_bullets = self.driver.find_element(By.ID, 'feature-bullets')
-                    if feature_bullets:
-                        # Get all text content and split by newlines
-                        all_text = feature_bullets.text.strip()
-                        items = [item.strip() for item in all_text.split('\n') if item.strip()]
-                        about_items = items
+                        error_text = await response.text()
+                        logger.error(f"Browserless API error: {response.status} - {error_text}")
+                        return None
                         
-            except Exception as e:
-                logger.warning(f"Error extracting About this item: {str(e)}")
-                
-            product_data['about_this_item'] = about_items if about_items else 'Not found'
-            
-            # Check for content type (A+ Content vs Regular Description)
-            aplus_element = self.driver.find_element(By.ID, 'aplus')
-            regular_desc_element = self.driver.find_element(By.ID, 'productDescription')
-            
-            if aplus_element:
-                product_data['content_type'] = 'A+ Content'
-            elif regular_desc_element:
-                product_data['content_type'] = 'Regular Description'
-            else:
-                product_data['content_type'] = 'No Description'
-            
-            # Images
-            product_data['images'] = []
-            
-            # Find the altImages div containing thumbnails
-            alt_images_div = self.driver.find_element(By.ID, 'altImages')
-            if alt_images_div:
-                # Find all thumbnail images
-                thumbnail_images = alt_images_div.find_elements(By.TAG_NAME, 'img')
-                for img in thumbnail_images:
-                    src = img.get_attribute('src')
-                    if src and '/images/I/' in src:
-                        try:
-                            # Extract image ID from the thumbnail URL
-                            image_id = src.split('/images/I/')[1].split('._')[0]
-                            # Construct full size image URL
-                            image_url = f"https://m.media-amazon.com/images/I/{image_id}._SY395_.jpg"
-                            if image_url not in product_data['images']:  # Avoid duplicates
-                                product_data['images'].append(image_url)
-                        except IndexError:
-                            continue
-            
-            logger.info(f"Successfully scraped product: {asin}")
-            return product_data
-            
-        except TimeoutException:
-            logger.error("Timeout while waiting for page load")
-            return None
-        except WebDriverException as e:
-            logger.error(f"WebDriver error: {str(e)}")
-            return None
         except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
+            logger.error(f"Error in Browserless scraping: {str(e)}")
             return None
+    
+    def _extract_product_data_from_browserless(self, browserless_result: Dict) -> Dict[str, Any]:
+        """Extract product data from Browserless API response"""
+        product_data = {}
+        
+        # Helper function to get text from element
+        def get_text(element, default='Not found'):
+            return element.get('text', default).strip() if element else default
+        
+        # Extract data from Browserless response
+        elements = browserless_result.get('elements', [])
+        element_map = {el.get('selector'): el for el in elements}
+        
+        # Product Title
+        product_data['title'] = get_text(element_map.get('#productTitle'))
+        
+        # Price
+        product_data['price'] = get_text(element_map.get('.a-price-whole'))
+        
+        # MRP
+        mrp_element = element_map.get('.a-price.a-text-price')
+        if mrp_element:
+            mrp = mrp_element.get('text', '').strip()
+            product_data['mrp'] = mrp if mrp else 'Not found'
+        else:
+            product_data['mrp'] = 'Not found'
+        
+        # ASIN
+        asin_element = element_map.get("input[name='ASIN']")
+        product_data['asin'] = asin_element.get('value', 'Not found') if asin_element else 'Not found'
+        
+        # SKU ID (Item model number)
+        product_data['sku_id'] = 'Not found'  # This will need to be extracted from the page content
+        
+        # Percentage Discount
+        discount_element = element_map.get('.savingsPercentage')
+        product_data['percentage_discount'] = get_text(discount_element)
+        
+        # Rating
+        rating_element = element_map.get('.a-icon-alt')
+        product_data['rating'] = rating_element.get('text', 'Not found').split()[0] if rating_element else 'Not found'
+        
+        # Number of ratings
+        num_ratings_element = element_map.get('#acrCustomerReviewText')
+        product_data['num_ratings'] = get_text(num_ratings_element)
+        
+        # About this item
+        about_items = []
+        feature_bullets = element_map.get('#feature-bullets')
+        if feature_bullets:
+            # Extract bullet points from the feature bullets section
+            # This will need to be adjusted based on the actual HTML structure
+            pass
+        product_data['about_this_item'] = about_items if about_items else 'Not found'
+        
+        # Content type
+        aplus_element = element_map.get('#aplus')
+        regular_desc_element = element_map.get('#productDescription')
+        
+        if aplus_element:
+            product_data['content_type'] = 'A+ Content'
+        elif regular_desc_element:
+            product_data['content_type'] = 'Regular Description'
+        else:
+            product_data['content_type'] = 'No Description'
+        
+        # Images
+        product_data['images'] = []
+        alt_images_div = element_map.get('#altImages')
+        if alt_images_div:
+            # Extract image URLs from the altImages div
+            # This will need to be adjusted based on the actual HTML structure
+            pass
+        
+        return product_data
     
     async def scrape_with_requests(self, asin: str) -> Optional[Dict[str, Any]]:
         """Scrape using requests with advanced anti-detection"""
@@ -322,59 +241,37 @@ class AmazonScraper:
         
         # SKU ID (Item model number)
         sku_id = None
-        
         # Try multiple selectors for different page layouts
         sku_selectors = [
             # Product Details section
-            (By.ID, 'productDetails_detailBullets_sections1'),
+            'div#productDetails_detailBullets_sections1',
             # Product Specifications section
-            (By.ID, 'productDetails_techSpec_section_1'),
+            'div#productDetails_techSpec_section_1',
             # Model number row
-            (By.XPATH, '//tr[contains(@class, "model_number")]'),
-            (By.XPATH, '//tr[contains(@class, "po-model_number")]'),
+            'tr.po-model_number',
+            'tr.model_number',
             # Direct model number span
-            (By.XPATH, '//span[contains(text(), "Model Number")]/following-sibling::span'),
-            (By.XPATH, '//span[contains(text(), "Item model number")]/following-sibling::span')
+            'span:-soup-contains("Model Number") + span',
+            'span:-soup-contains("Item model number") + span'
         ]
         
-        for selector_type, selector in sku_selectors:
+        for selector in sku_selectors:
             try:
-                if selector_type == By.ID:
-                    element = self.driver.find_element(selector_type, selector)
-                    rows = element.find_elements(By.TAG_NAME, 'tr')
-                    for row in rows:
-                        if any(keyword in row.text.lower() for keyword in ['model number', 'item model number']):
-                            sku_id = row.find_element(By.TAG_NAME, 'td').text.strip()
-                            break
-                else:
-                    element = self.driver.find_element(selector_type, selector)
-                    if element:
+                element = soup.select_one(selector)
+                if element:
+                    if selector.startswith('tr'):
+                        sku_id = element.find('td').text.strip()
+                    else:
                         sku_id = element.text.strip()
-                        break
+                    break
             except:
                 continue
-            
-            if sku_id:
-                break
         
         product_data['sku_id'] = sku_id if sku_id else 'Not found'
         
         # Percentage Discount
         discount_element = soup.find('span', {'class': 'savingsPercentage'})
-        if discount_element:
-            product_data['percentage_discount'] = discount_element.text.strip()
-        else:
-            # Calculate discount percentage if we have both price and MRP
-            if product_data['price'] != 'Not found' and product_data['mrp'] != 'Not found':
-                try:
-                    price = float(product_data['price'].replace(',', ''))
-                    mrp = float(product_data['mrp'].replace('₹', '').replace(',', '').strip())
-                    discount = ((mrp - price) / mrp) * 100
-                    product_data['percentage_discount'] = f"{discount:.2f}%"
-                except (ValueError, ZeroDivisionError):
-                    product_data['percentage_discount'] = 'Not found'
-            else:
-                product_data['percentage_discount'] = 'Not found'
+        product_data['percentage_discount'] = discount_element.text.strip() if discount_element else 'Not found'
         
         # Rating
         rating_element = soup.find('span', {'class': 'a-icon-alt'})
@@ -387,36 +284,10 @@ class AmazonScraper:
         # About this item
         about_items = []
         try:
-            # Try multiple selectors for different page layouts
-            selectors = [
-                'div#feature-bullets ul.a-unordered-list li span.a-list-item',
-                'div#feature-bullets ul.a-vertical-spacing-small li span.a-list-item',
-                'div#feature-bullets ul.a-spacing-small li span.a-list-item',
-                'div#feature-bullets ul.a-vertical li span.a-list-item',
-                'div#feature-bullets ul li span.a-list-item',
-                'div#feature-bullets ul li span.a-text-bold',
-                'div#feature-bullets ul li'
-            ]
-            
-            for selector in selectors:
-                bullet_points = soup.select(selector)
-                if bullet_points:
-                    for bullet in bullet_points:
-                        text = bullet.text.strip()
-                        if text and text not in about_items:  # Avoid duplicates
-                            about_items.append(text)
-                    if about_items:  # If we found items with this selector, break
-                        break
-                        
-            # If still no items found, try alternative approach
-            if not about_items:
-                feature_bullets = soup.find('div', {'id': 'feature-bullets'})
-                if feature_bullets:
-                    # Get all text content and split by newlines
-                    all_text = feature_bullets.text.strip()
-                    items = [item.strip() for item in all_text.split('\n') if item.strip()]
-                    about_items = items
-                    
+            feature_bullets = soup.find('div', {'id': 'feature-bullets'})
+            if feature_bullets:
+                bullet_points = feature_bullets.find_all('span', {'class': 'a-list-item'})
+                about_items = [bullet.text.strip() for bullet in bullet_points if bullet.text.strip()]
         except Exception as e:
             logger.warning(f"Error extracting About this item: {str(e)}")
             
@@ -435,21 +306,16 @@ class AmazonScraper:
         
         # Images
         product_data['images'] = []
-        
-        # Find the altImages div containing thumbnails
         alt_images_div = soup.find('div', {'id': 'altImages'})
         if alt_images_div:
-            # Find all thumbnail images
             thumbnail_images = alt_images_div.find_all('img', src=True)
             for img in thumbnail_images:
                 src = img.get('src', '')
                 if src and '/images/I/' in src:
                     try:
-                        # Extract image ID from the thumbnail URL
                         image_id = src.split('/images/I/')[1].split('._')[0]
-                        # Construct full size image URL
                         image_url = f"https://m.media-amazon.com/images/I/{image_id}._SY395_.jpg"
-                        if image_url not in product_data['images']:  # Avoid duplicates
+                        if image_url not in product_data['images']:
                             product_data['images'].append(image_url)
                     except IndexError:
                         continue
@@ -458,26 +324,17 @@ class AmazonScraper:
     
     async def scrape_product(self, asin: str) -> Optional[Dict[str, Any]]:
         """Main scraping method that tries different approaches"""
-        # Try Selenium first
-        result = await self.scrape_with_selenium(asin)
+        # Try Browserless first
+        result = await self.scrape_with_browserless(asin)
         if result:
             return result
             
-        # If Selenium fails, try requests
+        # If Browserless fails, try requests
         return await self.scrape_with_requests(asin)
-    
-    def cleanup(self):
-        """Cleanup resources"""
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
 
 # For backward compatibility
 async def scrape_amazon_product(asin: str) -> Optional[Dict[str, Any]]:
     """Backward compatible function that uses the new scraper"""
     scraper = AmazonScraper()
     await scraper.initialize()
-    try:
-        return await scraper.scrape_product(asin)
-    finally:
-        scraper.cleanup() 
+    return await scraper.scrape_product(asin) 
