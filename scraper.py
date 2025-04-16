@@ -45,7 +45,8 @@ class AmazonScraper:
             # Enhanced payload with captcha solving capabilities
             payload = {
                 "url": url,
-                "waitForFunction": """async () => {
+                "waitForFunction": {
+                    "fn": """async () => {
                     try {
                         const cdp = await page.createCDPSession();
                         // Wait for any captcha to appear
@@ -69,6 +70,9 @@ class AmazonScraper:
                         return false;
                     }
                 }""",
+                    "polling": 1000,  # Poll every second
+                    "timeout": 30000  # 30 second timeout
+                },
                 "waitForTimeout": 15000  # Increased timeout to allow for captcha solving
             }
             
